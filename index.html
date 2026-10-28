@@ -154,6 +154,14 @@
   .field label { display: block; font-size: 11px; font-weight: 500; color: var(--text-muted); margin-bottom: 4px; }
   .field .input { width: 100%; }
   .required { color: var(--red); }
+  .item-extra { border-top: 1px dashed var(--border-strong); padding-top: 12px; margin-top: 4px; display: flex; flex-direction: column; gap: 8px; }
+  .item-extra-head { display: flex; justify-content: space-between; align-items: center; }
+  .item-extra-head.hidden { display: none; }
+  .item-num { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); }
+  .item-extra .item-del { padding: 4px; }
+  .item-extra .item-del svg { width: 14px; height: 14px; }
+  .btn-add-item { align-self: flex-start; font-size: 12px; padding: 6px 12px; }
+  .btn-add-item.hidden { display: none; }
   .subtotal-preview { background: var(--hover); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; display: flex; justify-content: space-between; align-items: center; }
   .subtotal-preview .label { font-size: 13px; color: var(--text-muted); }
   .subtotal-preview .value { font-family: 'JetBrains Mono', monospace; font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; }
@@ -527,6 +535,7 @@ function extractFromImage(base64Image, mimeType) {
         <input type="text" class="input" id="f-proveedor" placeholder="Ej: Papelera del Pacífico" list="proveedores-list">
         <datalist id="proveedores-list"></datalist>
       </div>
+      <div class="item-extra-head hidden" id="item1-label"><span class="item-num">Ítem 1</span></div>
       <div class="field">
         <label>Producto / Descripción <span class="required">*</span></label>
         <input type="text" class="input" id="f-producto" placeholder="Ej: Papel bond carta 75gr">
@@ -541,6 +550,11 @@ function extractFromImage(base64Image, mimeType) {
         </div>
         <div class="field"><label>Costo unitario CLP <span class="required">*</span></label><input type="number" step="any" class="input font-mono" id="f-costo" placeholder="0"></div>
       </div>
+      <div id="items-extra"></div>
+      <button type="button" class="btn btn-secondary btn-add-item" id="btn-add-item">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        Agregar otro ítem de la misma boleta
+      </button>
       <div class="subtotal-preview hidden" id="subtotal-preview">
         <span class="label">Subtotal calculado</span>
         <span class="value" id="subtotal-value">$0</span>
@@ -675,13 +689,22 @@ async function apiGet() {
   if (!res.ok) throw new Error('HTTP ' + res.status);
   return await res.json();
 }
-async function apiPost(body) {
+async function apiPost(body, timeoutMs) {
   // No establecer Content-Type para evitar preflight CORS con Apps Script
-  const res = await fetch(API_URL, {
-    method: 'POST',
-    body: JSON.stringify(body),
-    redirect: 'follow',
-  });
+  const ctrl = timeoutMs ? new AbortController() : null;
+  const t = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
+  let res;
+  try {
+    res = await fetch(API_URL, {
+      method: 'POST',
+      body: JSON.stringify(body),
+      redirect: 'follow',
+      signal: ctrl ? ctrl.signal : undefined,
+    });
+  } catch (err) {
+    if (err.name === 'AbortError') throw new Error('Gemini tardó demasiado en responder');
+    throw err;
+  } finally { if (t) clearTimeout(t); }
   if (!res.ok) throw new Error('HTTP ' + res.status);
   return await res.json();
 }
@@ -986,22 +1009,27 @@ async function handleFotoSeleccionada(e) {
   const mimeType = 'image/jpeg';
 
   document.getElementById('foto-preview').src = dataUrl;
-  document.getElementById('foto-status').textContent = 'Analizando boleta…';
+  const status = document.getElementById('foto-status');
+  status.textContent = 'Analizando boleta…';
   document.getElementById('modal-foto').classList.remove('hidden');
+  // Gemini a veces tarda porque el servidor reintenta con otro modelo: se avisa para que no parezca pegado
+  const aviso = setTimeout(() => { status.textContent = 'Gemini está lento, probando de nuevo…'; }, 12000);
 
+  let data = {}, errorLectura = null;
   try {
-    const res = await apiPost({ action: 'extract', image: base64, mimeType });
-    document.getElementById('modal-foto').classList.add('hidden');
+    const res = await apiPost({ action: 'extract', image: base64, mimeType }, 100000);
     if (!res.ok) throw new Error(res.error || 'No se pudo leer la boleta');
-    abrirModalConDatosExtraidos(res.data || {}, base64, mimeType);
+    data = res.data || {};
   } catch (err) {
+    errorLectura = err.message; // la foto NO se pierde: se abre el registro con la foto adjunta
+  } finally {
+    clearTimeout(aviso);
     document.getElementById('modal-foto').classList.add('hidden');
-    alert('No se pudo extraer la información automáticamente (' + err.message + '). Completa el registro a mano y revisa que esté todo correcto.');
-    openModal();
   }
+  abrirModalConDatosExtraidos(data, base64, mimeType, errorLectura);
 }
 
-function abrirModalConDatosExtraidos(data, fotoBase64, fotoMime) {
+function abrirModalConDatosExtraidos(data, fotoBase64, fotoMime, errorLectura) {
   openModal(); // limpia cualquier foto pendiente anterior
   fotoPendienteBase64 = fotoBase64 || null;
   fotoPendienteMime = fotoMime || null;
@@ -1013,11 +1041,28 @@ function abrirModalConDatosExtraidos(data, fotoBase64, fotoMime) {
   const dd = String(hoy.getDate()).padStart(2, '0');
   document.getElementById('f-fecha').value = `${yyyy}-${mm}-${dd}`;
   if (data.proveedor) document.getElementById('f-proveedor').value = data.proveedor;
-  if (data.producto) document.getElementById('f-producto').value = data.producto;
-  if (data.cantidad !== null && data.cantidad !== undefined) document.getElementById('f-cantidad').value = data.cantidad;
-  if (data.costoUnitario !== null && data.costoUnitario !== undefined) document.getElementById('f-costo').value = data.costoUnitario;
+  if (data.documento) document.getElementById('f-referencia').value = data.documento;
+  // Formato nuevo: data.items = [{producto, cantidad, costoUnitario}, ...]. Formato antiguo: un solo producto.
+  const items = Array.isArray(data.items) && data.items.length ? data.items
+    : (data.producto || data.costoUnitario != null) ? [data] : [];
+  items.forEach((it, i) => {
+    if (i === 0) {
+      if (it.producto) document.getElementById('f-producto').value = it.producto;
+      if (it.cantidad !== null && it.cantidad !== undefined) document.getElementById('f-cantidad').value = it.cantidad;
+      if (it.costoUnitario !== null && it.costoUnitario !== undefined) document.getElementById('f-costo').value = it.costoUnitario;
+    } else {
+      agregarItem(it);
+    }
+  });
   document.getElementById('f-estado').value = 'recibido';
-  document.getElementById('f-notas').value = 'Registrado desde foto de boleta — revisa los datos antes de guardar.';
+  document.getElementById('f-notas').value = errorLectura
+    ? 'Foto de boleta adjunta — no se pudo leer automáticamente, datos ingresados a mano.'
+    : 'Registrado desde foto de boleta — revisa los datos antes de guardar.';
+  if (errorLectura) {
+    setTimeout(() => alert('No se pudo leer la boleta automáticamente.\n\n' + errorLectura + '\n\nLa foto quedó adjunta: completa los datos a mano y guarda.'), 50);
+  } else if (items.length > 1) {
+    setTimeout(() => alert('Se detectaron ' + items.length + ' ítems en la boleta. Revísalos antes de guardar: cada ítem queda como un registro aparte, todos con la misma foto.'), 50);
+  }
   updateSubtotalPreview();
 }
 
@@ -1034,6 +1079,9 @@ async function openModal(id) {
   fotoPendienteBase64 = null;
   fotoPendienteMime = null;
   document.getElementById('modal-foto-indicator').classList.add('hidden');
+  document.getElementById('items-extra').innerHTML = '';
+  document.getElementById('btn-add-item').classList.toggle('hidden', !!editingId);
+  document.getElementById('item1-label').classList.add('hidden');
   document.getElementById('modal-title').textContent = editingId ? 'Editar registro' : 'Nuevo registro';
   document.getElementById('modal-save-label').textContent = editingId ? 'Guardar cambios' : 'Agregar registro';
   if (editingId) {
@@ -1070,26 +1118,79 @@ function closeModal() {
 }
 
 function updateSubtotalPreview() {
-  const c = parseFloat(document.getElementById('f-cantidad').value);
-  const u = parseFloat(document.getElementById('f-costo').value);
+  const items = leerItems();
+  const total = items.reduce((s, it) => s + (it.cantidad > 0 && it.costoUnitario > 0 ? it.cantidad * it.costoUnitario : 0), 0);
   const box = document.getElementById('subtotal-preview');
-  if (!isNaN(c) && !isNaN(u) && c > 0 && u > 0) {
-    document.getElementById('subtotal-value').textContent = fmtCLP(c * u);
+  box.querySelector('.label').textContent = items.length > 1 ? `Total (${items.length} ítems)` : 'Subtotal calculado';
+  if (total > 0) {
+    document.getElementById('subtotal-value').textContent = fmtCLP(total);
     box.classList.remove('hidden');
   } else box.classList.add('hidden');
+}
+
+// ----------- Varios ítems por boleta/factura -----------
+const UNIDADES = ['unidad','caja','resma','rollo','pallet','kg','m','lt','paquete'];
+function agregarItem(it = {}) {
+  const cont = document.getElementById('items-extra');
+  const row = document.createElement('div');
+  row.className = 'item-extra';
+  const unidad = UNIDADES.includes(it.unidad) ? it.unidad : 'unidad';
+  row.innerHTML = `
+    <div class="item-extra-head">
+      <span class="item-num"></span>
+      <button type="button" class="icon-btn danger item-del" title="Quitar ítem">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div class="field"><input type="text" class="input i-producto" placeholder="Producto / Descripción" value="${escapeHtml(it.producto || '')}"></div>
+    <div class="field-grid-3">
+      <div class="field"><input type="number" step="any" class="input font-mono i-cantidad" placeholder="Cantidad" value="${it.cantidad ?? ''}"></div>
+      <div class="field"><select class="input i-unidad">${UNIDADES.map(u => `<option${u === unidad ? ' selected' : ''}>${u}</option>`).join('')}</select></div>
+      <div class="field"><input type="number" step="any" class="input font-mono i-costo" placeholder="Costo unitario" value="${it.costoUnitario ?? ''}"></div>
+    </div>`;
+  row.querySelector('.item-del').addEventListener('click', () => { row.remove(); renumerarItems(); updateSubtotalPreview(); });
+  row.querySelectorAll('.i-cantidad, .i-costo').forEach(i => i.addEventListener('input', updateSubtotalPreview));
+  cont.appendChild(row);
+  renumerarItems();
+  updateSubtotalPreview();
+  return row;
+}
+function renumerarItems() {
+  const rows = document.getElementById('items-extra').querySelectorAll('.item-extra');
+  rows.forEach((r, i) => { r.querySelector('.item-num').textContent = 'Ítem ' + (i + 2); });
+  document.getElementById('item1-label').classList.toggle('hidden', rows.length === 0);
+}
+// Ítem 1 = campos principales; los demás vienen de #items-extra (se ignoran filas totalmente vacías)
+function leerItems() {
+  const items = [{
+    producto: document.getElementById('f-producto').value.trim(),
+    cantidad: parseFloat(document.getElementById('f-cantidad').value),
+    unidad: document.getElementById('f-unidad').value,
+    costoUnitario: parseFloat(document.getElementById('f-costo').value),
+  }];
+  document.getElementById('items-extra').querySelectorAll('.item-extra').forEach(r => {
+    const it = {
+      producto: r.querySelector('.i-producto').value.trim(),
+      cantidad: parseFloat(r.querySelector('.i-cantidad').value),
+      unidad: r.querySelector('.i-unidad').value,
+      costoUnitario: parseFloat(r.querySelector('.i-costo').value),
+    };
+    if (it.producto || !isNaN(it.cantidad) || !isNaN(it.costoUnitario)) items.push(it);
+  });
+  return items;
 }
 
 async function saveForm() {
   const fecha = document.getElementById('f-fecha').value;
   const proveedor = document.getElementById('f-proveedor').value.trim();
-  const producto = document.getElementById('f-producto').value.trim();
-  const cantidad = parseFloat(document.getElementById('f-cantidad').value);
-  const unidad = document.getElementById('f-unidad').value;
-  const costoUnitario = parseFloat(document.getElementById('f-costo').value);
   const estado = document.getElementById('f-estado').value;
   const referencia = document.getElementById('f-referencia').value.trim();
   const notas = document.getElementById('f-notas').value.trim();
-  if (!fecha || !proveedor || !producto || isNaN(cantidad) || isNaN(costoUnitario)) return;
+  const items = leerItems();
+  const { producto, cantidad, unidad, costoUnitario } = items[0];
+  if (!fecha || !proveedor) { alert('Falta la fecha o el proveedor.'); return; }
+  const malo = items.findIndex(it => !it.producto || isNaN(it.cantidad) || isNaN(it.costoUnitario));
+  if (malo !== -1) { alert('Al ítem ' + (malo + 1) + ' le falta producto, cantidad o costo unitario.'); return; }
 
   const saveBtn = document.getElementById('modal-save');
   saveBtn.disabled = true;
@@ -1103,13 +1204,25 @@ async function saveForm() {
       if (!res.ok) throw new Error(res.error);
       Object.assign(existing, updated);
     } else {
-      const entry = { id: uid(), fecha, proveedor, producto, cantidad, unidad, costoUnitario, estado, referencia, notas, fotoUrl: '', creadoEn: Date.now(), actualizadoEn: Date.now() };
-      const body = { action: 'add', entry };
+      const ahora = Date.now();
+      const nuevos = items.map((it, i) => ({ id: uid(), fecha, proveedor, producto: it.producto, cantidad: it.cantidad, unidad: it.unidad, costoUnitario: it.costoUnitario, estado, referencia, notas, fotoUrl: '', creadoEn: ahora + i, actualizadoEn: ahora }));
+      // El primero sube la foto a Drive; el resto reutiliza el mismo link
+      const body = { action: 'add', entry: nuevos[0] };
       if (fotoPendienteBase64) { body.image = fotoPendienteBase64; body.mimeType = fotoPendienteMime; }
       const res = await apiPost(body);
       if (!res.ok) throw new Error(res.error);
-      if (res.entry && res.entry.fotoUrl) entry.fotoUrl = res.entry.fotoUrl;
-      entries.unshift(entry);
+      if (res.entry && res.entry.fotoUrl) nuevos.forEach(n => { n.fotoUrl = res.entry.fotoUrl; });
+      entries.unshift(nuevos[0]);
+      fotoPendienteBase64 = null; // ya quedó guardada
+      if (nuevos.length > 1) {
+        const resto = nuevos.slice(1);
+        const r2 = await apiPost({ action: 'bulk_add', entries: resto });
+        if (!r2.ok) {
+          closeModal(); render();
+          throw new Error('se guardó solo el ítem 1; los otros ' + resto.length + ' fallaron (' + r2.error + '). Agrégalos a mano.');
+        }
+        entries.unshift(...resto.reverse());
+      }
     }
     fotoPendienteBase64 = null;
     fotoPendienteMime = null;
@@ -1304,6 +1417,7 @@ document.getElementById('modal-cancel').addEventListener('click', closeModal);
 document.getElementById('modal-save').addEventListener('click', saveForm);
 document.getElementById('f-cantidad').addEventListener('input', updateSubtotalPreview);
 document.getElementById('f-costo').addEventListener('input', updateSubtotalPreview);
+document.getElementById('btn-add-item').addEventListener('click', () => { const r = agregarItem(); r.querySelector('.i-producto').focus(); });
 
 document.getElementById('filtro-mes').addEventListener('change', e => { filtros.mes = e.target.value; render(); });
 document.getElementById('filtro-proveedor').addEventListener('change', e => { filtros.proveedor = e.target.value; render(); });
