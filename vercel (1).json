@@ -1,0 +1,6 @@
+{
+  "rewrites": [
+    { "source": "/", "destination": "https://walterlund-web-tools.vercel.app/gas" },
+    { "source": "/js/:path*", "destination": "https://walterlund-web-tools.vercel.app/js/:path*" }
+  ]
+}
